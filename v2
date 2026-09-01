@@ -29,7 +29,7 @@ $LocationCache = @{}
 function Resolve-GroupName {
     param($Id)
 
-    if([string\]::IsNullOrWhiteSpace($Id)){ return "" }
+    if([string]::IsNullOrWhiteSpace($Id)){ return "" }
 
     if($GroupCache.ContainsKey($Id))
     {
@@ -49,7 +49,7 @@ function Resolve-GroupName {
 function Resolve-AppName {
     param($Id)
 
-    if([string]:::IsNullOrWhiteSpace($Id)){ return "" }
+    if([string]::IsNullOrWhiteSpace($Id)){ return "" }
 
     if($Id -eq "All")
     {
@@ -74,7 +74,7 @@ function Resolve-AppName {
 function Resolve-LocationName {
     param($Id)
 
-    if([string\]::IsNullOrWhiteSpace($Id))
+    if([string]::IsNullOrWhiteSpace($Id))
     {
         return "Not Configured"
     }
