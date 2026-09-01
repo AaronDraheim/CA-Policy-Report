@@ -1,0 +1,283 @@
+# This Sample Code is provided for the purpose of illustration only and is not intended to be used
+# in a production environment. THIS SAMPLE CODE AND ANY RELATED INFORMATION ARE PROVIDED "AS IS"
+# WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND/OR FITNESS FOR A PARTICULAR PURPOSE. We grant You a nonexclusive,
+# royalty-free right to use and modify the Sample Code and to reproduce and distribute the object code
+# form of the Sample Code, provided that You agree: (i) to not use Our name, logo, or trademarks to
+# market Your software product in which the Sample Code is embedded; (ii) to include a valid copyright
+# notice on Your software product in which the Sample Code is embedded; and (iii) to indemnify, hold
+# harmless, and defend Us and Our suppliers from and against any claims or lawsuits, including attorneys’
+# fees, that arise or result from the use or distribution of the Sample Code.
+ 
+# This sample script is not supported under any Microsoft standard support program or service.
+# The sample script is provided AS IS without warranty of any kind. Microsoft further disclaims
+# all implied warranties including, without limitation, any implied warranties of merchantability
+# or of fitness for a particular purpose. The entire risk arising out of the use or performance of
+# the sample scripts and documentation remains with you. In no event shall Microsoft, its authors,
+# or anyone else involved in the creation, production, or delivery of the scripts be liable for any
+# damages whatsoever (including, without limitation, damages for loss of business profits, business
+# interruption, loss of business information, or other pecuniary loss) arising out of the use of or
+# inability to use the sample scripts or documentation, even if Microsoft has been advised of the possibility of such damages.
+
+
+
+#Requires -Modules Microsoft.Graph.Authentication,Microsoft.Graph.Identity.SignIns
+
+<#
+.SYNOPSIS
+Export Human Readable Conditional Access Report
+
+.REQUIREMENTS
+Policy.Read.All
+Directory.Read.All
+
+.EXAMPLE
+.\Export-CAReport.ps1
+#>
+
+Connect-MgGraph -Scopes "Policy.Read.All","Directory.Read.All"
+
+Add-Type -AssemblyName System.Windows.Forms
+
+$FolderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+$FolderBrowser.Description = "Select output folder for Conditional Access Report"
+
+if ($FolderBrowser.ShowDialog() -ne "OK")
+{
+    Write-Host "Operation cancelled."
+    return
+}
+
+$OutputFolder = $FolderBrowser.SelectedPath
+$TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+$HtmlReport = Join-Path $OutputFolder "ConditionalAccessReport_$TimeStamp.html"
+
+# Cache lookups to improve speed
+$ServicePrincipalCache = @{}
+$GroupCache = @{}
+$RoleCache = @{}
+$LocationCache = @{}
+
+Write-Host "Collecting Conditional Access policies..." -ForegroundColor Cyan
+
+$Policies = Get-MgIdentityConditionalAccessPolicy -All
+
+function Resolve-Application {
+    param($AppId)
+
+    if ($AppId -eq "All") { return "All Cloud Apps" }
+
+    if ($ServicePrincipalCache.ContainsKey($AppId))
+    {
+        return $ServicePrincipalCache[$AppId]
+    }
+
+    try {
+        $App = Get-MgServicePrincipal -ServicePrincipalId $AppId -ErrorAction Stop
+        $ServicePrincipalCache[$AppId] = $App.DisplayName
+        return $App.DisplayName
+    }
+    catch {
+        return $AppId
+    }
+}
+
+function Resolve-Group {
+    param($GroupId)
+
+    if ($GroupId -eq "All") { return "All Users" }
+
+    if ($GroupCache.ContainsKey($GroupId))
+    {
+        return $GroupCache[$GroupId]
+    }
+
+    try {
+        $Group = Get-MgGroup -GroupId $GroupId
+        $GroupCache[$GroupId] = $Group.DisplayName
+        return $Group.DisplayName
+    }
+    catch {
+        return $GroupId
+    }
+}
+
+function Resolve-Role {
+    param($RoleId)
+
+    if ($RoleCache.ContainsKey($RoleId))
+    {
+        return $RoleCache[$RoleId]
+    }
+
+    try {
+        $Role = Get-MgDirectoryRoleTemplate -DirectoryRoleTemplateId $RoleId
+        $RoleCache[$RoleId] = $Role.DisplayName
+        return $Role.DisplayName
+    }
+    catch {
+        return $RoleId
+    }
+}
+
+function Resolve-Location {
+    param($LocationId)
+
+    if ($LocationId -eq "All")
+    {
+        return "Any Location"
+    }
+
+    if ($LocationCache.ContainsKey($LocationId))
+    {
+        return $LocationCache[$LocationId]
+    }
+
+    try {
+        $Location = Get-MgIdentityConditionalAccessNamedLocation `
+            -NamedLocationId $LocationId
+
+        $LocationCache[$LocationId] = $Location.DisplayName
+        return $Location.DisplayName
+    }
+    catch {
+        return $LocationId
+    }
+}
+
+$Html = @"
+<html>
+<head>
+<title>Conditional Access Report</title>
+
+<style>
+body {
+    font-family: Segoe UI;
+    margin:20px;
+}
+
+table {
+    border-collapse:collapse;
+    width:100%;
+}
+
+th,td {
+    border:1px solid #cccccc;
+    padding:8px;
+    vertical-align:top;
+}
+
+th {
+    background-color:#0078D4;
+    color:white;
+}
+
+tr:nth-child(even) {
+    background:#f2f2f2;
+}
+
+h1 {
+    color:#0078D4;
+}
+</style>
+</head>
+<body>
+
+<h1>Microsoft Entra Conditional Access Assessment Report</h1>
+
+<p><strong>Generated:</strong> $(Get-Date)</p>
+
+<table>
+<tr>
+<th>Policy Name</th>
+<th>State</th>
+<th>Targets</th>
+<th>Conditions</th>
+<th>Actions</th>
+</tr>
+"@
+
+foreach ($Policy in $Policies)
+{
+    $TargetUsers = @()
+
+    $TargetUsers += $Policy.Conditions.Users.IncludeUsers
+    $TargetUsers += ($Policy.Conditions.Users.IncludeGroups | ForEach-Object { Resolve-Group $_ })
+    $TargetUsers += ($Policy.Conditions.Users.IncludeRoles | ForEach-Object { Resolve-Role $_ })
+
+    $TargetApps = @(
+        $Policy.Conditions.Applications.IncludeApplications |
+        ForEach-Object { Resolve-Application $_ }
+    )
+
+    $Locations = @(
+        $Policy.Conditions.Locations.IncludeLocations |
+        ForEach-Object { Resolve-Location $_ }
+    )
+
+    $Platforms = $Policy.Conditions.Platforms.IncludePlatforms
+    $ClientApps = $Policy.Conditions.ClientAppTypes
+
+    $GrantControls = $Policy.GrantControls.BuiltInControls
+    $GrantOperator = $Policy.GrantControls.Operator
+
+    $TargetSummary = @"
+<b>Users / Groups:</b><br>
+$($TargetUsers -join "<br>")
+
+<br><br>
+
+<b>Applications:</b><br>
+$($TargetApps -join "<br>")
+"@
+
+    $ConditionSummary = @"
+<b>Platforms:</b><br>
+$($Platforms -join "<br>")
+
+<br><br>
+
+<b>Locations:</b><br>
+$($Locations -join "<br>")
+
+<br><br>
+
+<b>Client Apps:</b><br>
+$($ClientApps -join "<br>")
+"@
+
+    $ActionSummary = @"
+<b>Grant Controls:</b><br>
+$($GrantControls -join "<br>")
+
+<br><br>
+
+<b>Operator:</b><br>
+$GrantOperator
+"@
+
+    $Html += @"
+<tr>
+<td>$($Policy.DisplayName)</td>
+<td>$($Policy.State)</td>
+<td>$TargetSummary</td>
+<td>$ConditionSummary</td>
+<td>$ActionSummary</td>
+</tr>
+"@
+}
+
+$Html += @"
+</table>
+</body>
+</html>
+"@
+
+$Html | Out-File $HtmlReport -Encoding UTF8
+
+Write-Host ""
+Write-Host "Report Complete" -ForegroundColor Green
+Write-Host "Output: $HtmlReport" -ForegroundColor Yellow
+
+Start-Process $HtmlReport
