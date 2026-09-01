@@ -18,12 +18,13 @@
 # damages whatsoever (including, without limitation, damages for loss of business profits, business
 # interruption, loss of business information, or other pecuniary loss) arising out of the use of or
 # inability to use the sample scripts or documentation, even if Microsoft has been advised of the possibility of such damages.
-
 #Requires -Modules Microsoft.Graph.Authentication
 
+# Load Windows Forms assemblies used for tenant input and output-folder dialogs.
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# Build the tenant-entry dialog. Tenants are processed in the entered top-to-bottom order.
 $InputForm = New-Object System.Windows.Forms.Form
 $InputForm.Text = "Microsoft Entra Multi-Tenant Conditional Access Assessment"
 $InputForm.Size = New-Object System.Drawing.Size(760,545)
@@ -56,6 +57,7 @@ $InputForm.CancelButton = $CancelButton
 $InputForm.Controls.Add($CancelButton)
 if ($InputForm.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
 
+# Parse each Friendly Name | Tenant ID entry into a collection of tenant targets.
 $TenantTargets = @()
 foreach ($Line in ($TenantText.Lines)) {
     if ([string]::IsNullOrWhiteSpace($Line)) { continue }
@@ -65,6 +67,7 @@ foreach ($Line in ($TenantText.Lines)) {
 }
 if ($TenantTargets.Count -eq 0) { throw "No tenants were entered." }
 
+# Select the output folder and define timestamped consolidated report files.
 $FolderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
 $FolderBrowser.Description = "Select output folder"
 if ($FolderBrowser.ShowDialog() -ne "OK") { return }
@@ -74,12 +77,18 @@ $ReportFile = Join-Path $OutputFolder "ConditionalAccess_MultiTenant_Assessment_
 $JsonFile = Join-Path $OutputFolder "ConditionalAccess_MultiTenant_Raw_$TimeStamp.json"
 $Scopes = @("Policy.Read.All","Directory.Read.All","Application.Read.All","RoleManagement.Read.Directory","Agreement.Read.All")
 
+# HTML-encode dynamic values before inserting them into the report.
 function ConvertTo-HtmlEncoded($Value) { if ($null -eq $Value) { return "" }; return [System.Net.WebUtility]::HtmlEncode([string]$Value) }
+# Retrieve every page from a Microsoft Graph collection by following @odata.nextLink.
 function Get-AllGraphPages($Uri) { $Items=[System.Collections.Generic.List[object]]::new(); do { $Page=Invoke-MgGraphRequest -Method GET -Uri $Uri -OutputType Hashtable; foreach($Item in @($Page["value"])) { if($null-ne$Item){$Items.Add([pscustomobject]$Item)} }; $Uri=$Page["@odata.nextLink"] } while(-not[string]::IsNullOrWhiteSpace([string]$Uri)); return @($Items) }
+# Normalize arrays for stable, case-insensitive cross-tenant comparisons.
 function Get-NormalizedArray($Value) { return @($Value|Where-Object{$null-ne$_-and[string]$_-ne""}|ForEach-Object{([string]$_).ToLowerInvariant()}|Sort-Object -Unique) }
+# Create a human-readable effect key describing the control, audience, resource, and risk condition.
 function Get-PolicyEffectKey($Policy) { $Controls=@(Get-NormalizedArray $Policy.GrantControls.BuiltInControls); $Users=@(Get-NormalizedArray $Policy.Conditions.Users.IncludeUsers); $Groups=@(Get-NormalizedArray $Policy.Conditions.Users.IncludeGroups); $Roles=@(Get-NormalizedArray $Policy.Conditions.Users.IncludeRoles); $Apps=@(Get-NormalizedArray $Policy.Conditions.Applications.IncludeApplications); $Actions=@(Get-NormalizedArray $Policy.Conditions.Applications.IncludeUserActions); $UserRisk=@(Get-NormalizedArray $Policy.Conditions.UserRiskLevels); $SignInRisk=@(Get-NormalizedArray $Policy.Conditions.SignInRiskLevels); $Effect=if($Controls-contains'block'){'Block access'}elseif($Controls-contains'passwordchange'){'Require password change'}elseif($Controls-contains'mfa'){'Require MFA'}elseif($Controls-contains'compliantdevice'){'Require compliant device'}elseif($Controls-contains'domainjoineddevice'){'Require hybrid joined device'}elseif($Policy.GrantControls.AuthenticationStrength.DisplayName){'Require authentication strength'}else{'Other Conditional Access control'}; $Audience=if($Roles.Count-gt0){'directory roles'}elseif($Users-contains'all'){'all users'}elseif($Groups.Count-gt0){'selected groups'}elseif($Users.Count-gt0){'selected users'}else{'unspecified identities'}; $Resource=if($Actions-contains'urn:user:registersecurityinfo'){'security information registration'}elseif($Apps-contains'all'){'all cloud apps'}elseif($Apps.Count-gt0){'selected apps'}else{'unspecified resources'}; $Condition=if($UserRisk.Count-gt0){' on '+($UserRisk-join',')+' user risk'}elseif($SignInRisk.Count-gt0){' on '+($SignInRisk-join',')+' sign-in risk'}else{''}; return "$Effect for $Audience on $Resource$Condition" }
+# Create a normalized configuration signature for detecting equivalent or different implementations.
 function Get-PolicyConfigSignature($Policy) { $U=$Policy.Conditions.Users;$A=$Policy.Conditions.Applications;$L=$Policy.Conditions.Locations;$P=$Policy.Conditions.Platforms;$Parts=@("users="+((Get-NormalizedArray $U.IncludeUsers)-join","),"groups="+((Get-NormalizedArray $U.IncludeGroups)-join","),"roles="+((Get-NormalizedArray $U.IncludeRoles)-join","),"apps="+((Get-NormalizedArray $A.IncludeApplications)-join","),"actions="+((Get-NormalizedArray $A.IncludeUserActions)-join","),"clientApps="+((Get-NormalizedArray $Policy.Conditions.ClientAppTypes)-join","),"platforms="+((Get-NormalizedArray $P.IncludePlatforms)-join","),"locations="+((Get-NormalizedArray $L.IncludeLocations)-join","),"userRisk="+((Get-NormalizedArray $Policy.Conditions.UserRiskLevels)-join","),"signInRisk="+((Get-NormalizedArray $Policy.Conditions.SignInRiskLevels)-join","),"controls="+((Get-NormalizedArray $Policy.GrantControls.BuiltInControls)-join","),"operator="+([string]$Policy.GrantControls.Operator).ToLowerInvariant(),"authStrength="+([string]$Policy.GrantControls.AuthenticationStrength.DisplayName).ToLowerInvariant(),"session="+($Policy.SessionControls|ConvertTo-Json -Depth 30 -Compress)); return ($Parts-join"|") }
 
+# Collect Conditional Access policies from each requested tenant using delegated interactive sign-in.
 $TenantResults=@()
 foreach($Target in $TenantTargets){
     Write-Host "Sign in to $($Target.Name) [$($Target.TenantId)]" -ForegroundColor Cyan
@@ -88,10 +97,12 @@ foreach($Target in $TenantTargets){
         Connect-MgGraph -TenantId $Target.TenantId -Scopes $Scopes -ContextScope Process -NoWelcome
         $Context=Get-MgContext
         if($Context.TenantId-ne$Target.TenantId){throw "Connected tenant does not match requested tenant."}
+# Query both v1.0 and beta; retain the larger collection when beta exposes additional policies.
         $Policies=@(Get-AllGraphPages "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies")
         $BetaPolicies=@(Get-AllGraphPages "https://graph.microsoft.com/beta/identity/conditionalAccess/policies")
         if($BetaPolicies.Count-gt$Policies.Count){$Policies=$BetaPolicies}
         $Policies=@($Policies|Sort-Object Id -Unique)
+# Reduce each policy to the fields required for effect grouping and configuration comparison.
         $Normalized=@($Policies|ForEach-Object{[pscustomobject]@{EffectKey=Get-PolicyEffectKey $_;Signature=Get-PolicyConfigSignature $_;PolicyId=$_.Id;DisplayName=$_.DisplayName;State=$_.State;TemplateId=$_.TemplateId;Controls=@(Get-NormalizedArray $_.GrantControls.BuiltInControls)-join',';Users=@(Get-NormalizedArray $_.Conditions.Users.IncludeUsers)-join',';Groups=@(Get-NormalizedArray $_.Conditions.Users.IncludeGroups)-join',';Roles=@(Get-NormalizedArray $_.Conditions.Users.IncludeRoles)-join',';Apps=@(Get-NormalizedArray $_.Conditions.Applications.IncludeApplications)-join','}})
         $TenantResults+=[pscustomobject]@{Name=$Target.Name;TenantId=$Target.TenantId;Account=$Context.Account;Status="Collected";Error=$null;Policies=$Policies;Normalized=$Normalized}
         Write-Host "Collected $($Policies.Count) policies." -ForegroundColor Green
@@ -102,14 +113,21 @@ foreach($Target in $TenantTargets){
 }
 Disconnect-MgGraph -ErrorAction SilentlyContinue|Out-Null
 
+# Save a lossless combined JSON export for all tenants.
 [pscustomobject]@{Generated=(Get-Date).ToString("o");Tenants=$TenantResults}|ConvertTo-Json -Depth 100|Out-File -FilePath $JsonFile -Encoding utf8
+# Build the cross-tenant effect inventory from successfully collected tenants.
 $CollectedTenants=@($TenantResults|Where-Object{$_.Status-eq"Collected"})
 $AllEffectKeys=@($CollectedTenants.Normalized.EffectKey|Sort-Object -Unique)
+# Produce one matrix row per policy effect, deduplicate policy IDs, and classify tenant differences.
 $MatrixRows=foreach($Key in $AllEffectKeys){$Cells=@();$Present=@();foreach($Tenant in $TenantResults){if($Tenant.Status-ne'Collected'){$Cells+="<td class='failed'>Collection failed</td>";continue};$Matches=@($Tenant.Normalized|Where-Object{$_.EffectKey-eq$Key}|Sort-Object PolicyId -Unique);if($Matches.Count-eq0){$Cells+="<td class='missing'>Not identified</td>";continue};$Present+=$Tenant.Name;$States=@($Matches.State|Sort-Object -Unique);$Signatures=@($Matches.Signature|Sort-Object -Unique);$PolicyEntries=@($Matches|Group-Object PolicyId|ForEach-Object{$M=$_.Group[0];"<div class='policy-entry'><span class='policy-friendly'>$(ConvertTo-HtmlEncoded $M.DisplayName)</span><span class='policy-id'>$(ConvertTo-HtmlEncoded $M.PolicyId)</span></div>"});$StateText=$States-join', ';$Detail=if($Matches.Count-gt1){"<small class='consolidated'>$($Matches.Count) distinct policies share this effect</small>"}else{''};$CellClass=if($States.Count-gt1-or$Signatures.Count-gt1){'warning'}else{''};$Cells+="<td class='$CellClass'><b>$StateText</b>$($PolicyEntries-join'')$Detail</td>"};$AllMatches=@($TenantResults|Where-Object{$_.Status-eq'Collected'}|ForEach-Object{$_.Normalized|Where-Object{$_.EffectKey-eq$Key}});$UniqueSignatures=@($AllMatches.Signature|Sort-Object -Unique);$UniqueStates=@($AllMatches.State|Sort-Object -Unique);$MissingCount=$CollectedTenants.Count-$Present.Count;$Result=if($CollectedTenants.Count-lt2){'No comparison tenant'}elseif($MissingCount-gt0){"Missing in $MissingCount tenant(s)"}elseif($UniqueSignatures.Count-eq1-and$UniqueStates.Count-eq1){'Equivalent effect and configuration'}elseif($UniqueSignatures.Count-eq1){'Same configuration; state differs'}else{'Same effect; configuration differs'};$ResultClass=if($Result-like'Equivalent*'){'Consistent'}elseif($Result-like'Missing*'){'Incomplete'}else{'Configuration-mismatch'};"<tr><td><b>$(ConvertTo-HtmlEncoded $Key)</b></td>$($Cells-join'')<td class='$ResultClass'>$Result</td></tr>"}
+# Generate dynamic tenant column headers and summary cards.
 $TenantHeaders=($TenantResults|ForEach-Object{"<th>$(ConvertTo-HtmlEncoded $_.Name)</th>"})-join""
 $TenantCards=($TenantResults|ForEach-Object{"<div class='card'><strong>$(ConvertTo-HtmlEncoded $_.Name)</strong><span>$(@($_.Policies).Count)</span><small>$(ConvertTo-HtmlEncoded $_.Status)</small></div>"})-join""
+# Build collapsible tenant inventories with raw policy JSON for traceability.
 $TenantSections=foreach($Tenant in $TenantResults){if($Tenant.Status-ne"Collected"){"<details class='tenant'><summary>$(ConvertTo-HtmlEncoded $Tenant.Name) — Collection failed</summary><p class='error'>$(ConvertTo-HtmlEncoded $Tenant.Error)</p></details>";continue};$PolicySections=foreach($Policy in $Tenant.Policies){$Json=ConvertTo-HtmlEncoded ($Policy|ConvertTo-Json -Depth 100);"<details class='policy'><summary><b>$(ConvertTo-HtmlEncoded $Policy.DisplayName)</b><br><small>State: $(ConvertTo-HtmlEncoded $Policy.State) | ID: $(ConvertTo-HtmlEncoded $Policy.Id)</small></summary><pre>$Json</pre></details>"};"<details class='tenant'><summary>$(ConvertTo-HtmlEncoded $Tenant.Name) — $(@($Tenant.Policies).Count) policies</summary><p>Tenant ID: $(ConvertTo-HtmlEncoded $Tenant.TenantId)<br>Account: $(ConvertTo-HtmlEncoded $Tenant.Account)</p>$($PolicySections-join'')</details>"}
+# Assemble the consolidated HTML report and its visual styles.
 $Html="<!doctype html><html><head><meta charset='utf-8'><title>Multi-Tenant Conditional Access Assessment</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;background:#f5f7fa;color:#242424}h1,h2{color:#0067b8}.cards{display:flex;gap:12px;flex-wrap:wrap}.card{background:white;border-left:5px solid #0078d4;padding:12px 18px;min-width:180px;box-shadow:0 1px 4px #bbb}.card span{display:block;font-size:28px;font-weight:700}table{border-collapse:collapse;width:100%;background:white;table-layout:fixed}th,td{border:1px solid #ccc;padding:8px;vertical-align:top;word-wrap:break-word}th{background:#eaf3f8}.tenant,.policy{background:white;margin:14px 0;box-shadow:0 1px 4px #bbb}.tenant>summary,.policy>summary{cursor:pointer;padding:12px;background:#eaf3f8;color:#004578}.policy{margin:8px 16px}.policy>summary{background:#f3f8fb}.missing,.failed{background:#fde7e9;color:#a80000;font-weight:700}.warning,.Configuration-mismatch,.Incomplete{background:#fff4ce;font-weight:700}.Consistent{background:#dff6dd;color:#107c10;font-weight:700}.error{color:#a80000}.policy-entry{margin-top:6px;padding-top:5px;border-top:1px solid #ddd}.policy-entry:first-of-type{border-top:0}.policy-friendly{display:block;font-weight:600}.policy-id{display:block;font-size:11px;color:#605e5c;font-family:Consolas,monospace}.consolidated{display:block;margin-top:7px;color:#605e5c}pre{white-space:pre-wrap;word-break:break-word;background:#202020;color:#fff;padding:12px;max-height:500px;overflow:auto}</style></head><body><h1>Microsoft Entra Multi-Tenant Conditional Access Assessment</h1><p>Generated: $(Get-Date) | Requested tenants: $($TenantResults.Count) | Successfully collected: $($CollectedTenants.Count)</p><div class='cards'>$TenantCards</div><h2>Cross-tenant policy consistency matrix</h2><p>Policies are grouped by effective outcome, such as Block access or Require MFA, then by targeted identities, resources, and risk conditions. Multiple policies with the same effect are consolidated into one row. The result highlights missing effects, state differences, and configuration differences.</p><table><tr><th>Policy effect and target</th>$TenantHeaders<th>Result</th></tr>$($MatrixRows-join'')</table><h2>Tenant inventories</h2>$($TenantSections-join'')</body></html>"
+# Write the report files and open the completed HTML assessment.
 $Html|Out-File -FilePath $ReportFile -Encoding utf8
 Write-Host "Multi-tenant report complete" -ForegroundColor Green
 Write-Host "HTML: $ReportFile" -ForegroundColor Yellow
