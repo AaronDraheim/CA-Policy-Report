@@ -1,0 +1,281 @@
+#Requires -Modules Microsoft.Graph.Authentication,Microsoft.Graph.Identity.SignIns
+
+Connect-MgGraph -Scopes "Policy.Read.All","Directory.Read.All"
+
+Add-Type -AssemblyName System.Windows.Forms
+
+$FolderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+$FolderBrowser.Description = "Select Output Folder"
+
+if ($FolderBrowser.ShowDialog() -ne "OK")
+{
+    Write-Host "Cancelled"
+    return
+}
+
+$OutputFolder = $FolderBrowser.SelectedPath
+
+$ReportFile = Join-Path $OutputFolder `
+    "ConditionalAccessAssessment_$(Get-Date -Format yyyyMMdd_HHmmss).html"
+
+Write-Host "Collecting Conditional Access Policies..." -ForegroundColor Cyan
+
+$Policies = Get-MgIdentityConditionalAccessPolicy -All
+
+$GroupCache = @{}
+$SPCache = @{}
+$LocationCache = @{}
+
+function Resolve-GroupName {
+    param($Id)
+
+    if([string\]::IsNullOrWhiteSpace($Id)){ return "" }
+
+    if($GroupCache.ContainsKey($Id))
+    {
+        return $GroupCache[$Id]
+    }
+
+    try{
+        $Group = Get-MgGroup -GroupId $Id -ErrorAction Stop
+        $GroupCache[$Id] = $Group.DisplayName
+        return $Group.DisplayName
+    }
+    catch{
+        return $Id
+    }
+}
+
+function Resolve-AppName {
+    param($Id)
+
+    if([string]:::IsNullOrWhiteSpace($Id)){ return "" }
+
+    if($Id -eq "All")
+    {
+        return "All Cloud Applications"
+    }
+
+    if($SPCache.ContainsKey($Id))
+    {
+        return $SPCache[$Id]
+    }
+
+    try{
+        $SP = Get-MgServicePrincipal -ServicePrincipalId $Id -ErrorAction Stop
+        $SPCache[$Id] = $SP.DisplayName
+        return $SP.DisplayName
+    }
+    catch{
+        return $Id
+    }
+}
+
+function Resolve-LocationName {
+    param($Id)
+
+    if([string\]::IsNullOrWhiteSpace($Id))
+    {
+        return "Not Configured"
+    }
+
+    if($Id -eq "All")
+    {
+        return "Any Location"
+    }
+
+    if($LocationCache.ContainsKey($Id))
+    {
+        return $LocationCache[$Id]
+    }
+
+    try{
+        $Location = Get-MgIdentityConditionalAccessNamedLocation `
+            -NamedLocationId $Id `
+            -ErrorAction Stop
+
+        $LocationCache[$Id] = $Location.DisplayName
+
+        return $Location.DisplayName
+    }
+    catch{
+        return $Id
+    }
+}
+
+function Convert-GrantControl {
+    param($Control)
+
+    switch ($Control)
+    {
+        "mfa" { "Require Multifactor Authentication" }
+        "block" { "Block Access" }
+        "passwordChange" { "Require Password Change" }
+        "compliantDevice" { "Require Compliant Device" }
+        "domainJoinedDevice" { "Require Hybrid Joined Device" }
+        "approvedApplication" { "Require Approved Client App" }
+        "compliantApplication" { "Require App Protection Policy" }
+        default { $Control }
+    }
+}
+
+$Html = @"
+<html>
+<head>
+<title>Conditional Access Assessment</title>
+
+<style>
+body{
+font-family:Segoe UI;
+margin:20px;
+}
+
+table{
+border-collapse:collapse;
+width:100%;
+}
+
+th{
+background:#0078D4;
+color:white;
+padding:10px;
+border:1px solid #ccc;
+text-align:left;
+}
+
+td{
+padding:10px;
+border:1px solid #ccc;
+vertical-align:top;
+}
+
+tr:nth-child(even){
+background:#f5f5f5;
+}
+
+h1{
+color:#0078D4;
+}
+</style>
+</head>
+<body>
+
+<h1>Microsoft Entra Conditional Access Assessment Report</h1>
+
+<p>
+Generated: $(Get-Date)
+</p>
+
+<table>
+<tr>
+<th>Policy</th>
+<th>State</th>
+<th>Targets</th>
+<th>What The Policy Does</th>
+</tr>
+"@
+
+foreach($Policy in $Policies)
+{
+    $IncludedGroups =
+        $Policy.Conditions.Users.IncludeGroups |
+        ForEach-Object { Resolve-GroupName $_ }
+
+    $Applications =
+        $Policy.Conditions.Applications.IncludeApplications |
+        ForEach-Object { Resolve-AppName $_ }
+
+    $Locations =
+        $Policy.Conditions.Locations.IncludeLocations |
+        ForEach-Object { Resolve-LocationName $_ }
+
+    $GrantControls =
+        $Policy.GrantControls.BuiltInControls |
+        ForEach-Object { Convert-GrantControl $_ }
+
+    $UserTargets = @()
+
+    if($Policy.Conditions.Users.IncludeUsers -contains "All")
+    {
+        $UserTargets += "All Users"
+    }
+
+    if($IncludedGroups)
+    {
+        $UserTargets += $IncludedGroups
+    }
+
+    if(-not $UserTargets)
+    {
+        $UserTargets += "Not Specified"
+    }
+
+    if(-not $Applications)
+    {
+        $Applications = @("Not Specified")
+    }
+
+    if(-not $Locations)
+    {
+        $Locations = @("Any Location")
+    }
+
+    $HumanSummary = @()
+
+    $HumanSummary += "Applies to $($UserTargets -join ', ')."
+
+    $HumanSummary += "Targets $($Applications -join ', ')."
+
+    if($GrantControls)
+    {
+        $HumanSummary += "Enforces $($GrantControls -join ', ')."
+    }
+
+    if($Policy.Conditions.SignInRiskLevels)
+    {
+        $HumanSummary += "Sign-in risk condition: $($Policy.Conditions.SignInRiskLevels -join ', ')."
+    }
+
+    if($Policy.Conditions.UserRiskLevels)
+    {
+        $HumanSummary += "User risk condition: $($Policy.Conditions.UserRiskLevels -join ', ')."
+    }
+
+    if($Locations)
+    {
+        $HumanSummary += "Location condition: $($Locations -join ', ')."
+    }
+
+    $Html += @"
+<tr>
+<td>$($Policy.DisplayName)</td>
+<td>$($Policy.State)</td>
+<td>
+<b>Users:</b><br>
+$($UserTargets -join '<br>')
+
+<br><br>
+
+<b>Apps:</b><br>
+$($Applications -join '<br>')
+</td>
+<td>
+$($HumanSummary -join ' ')
+</td>
+</tr>
+"@
+}
+
+$Html += @"
+</table>
+</body>
+</html>
+"@
+
+$Html | Out-File $ReportFile -Encoding UTF8
+
+Write-Host ""
+Write-Host "Report Complete" -ForegroundColor Green
+Write-Host $ReportFile -ForegroundColor Yellow
+
+Start-Process $ReportFile
